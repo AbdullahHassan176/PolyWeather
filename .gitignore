@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+polyweather.log
+weather_cache.json
+paper_trades.jsonl
