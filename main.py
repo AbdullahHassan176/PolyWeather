@@ -200,20 +200,14 @@ def run_scan():
             continue
 
         # ── Bid/ask spread (one order-book call per signal) ───────────────────
-        spread_data = fetch_spread(signal.token_id, clob)
+        # Always fetch the YES token's order book — it has the real liquidity.
+        # For NO bets, the YES spread mirrors the NO spread (they sum to 1).
+        yes_token_id = market["yes_token_id"]
+        spread_data = fetch_spread(yes_token_id, clob)
         signal.bid    = spread_data["bid"]
         signal.ask    = spread_data["ask"]
         signal.spread = spread_data["spread"]
         signal.volume_24h = float(market.get("volume_24hr", 0) or 0)
-
-        # Skip illiquid markets — wide spread means worse fill and signals
-        # that market makers aren't confident in the price
-        if signal.spread > cfg.max_spread:
-            logger.debug(
-                f"Spread too wide ({signal.spread:.3f} > {cfg.max_spread}) — skipping: "
-                f"{market['question'][:55]}"
-            )
-            continue
 
         # ── Budget check ──────────────────────────────────────────────────────
         if signal.bet_usdc > budget:

@@ -46,7 +46,7 @@ class Config:
     dry_run: bool = field(default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true")
 
     # Maximum bid-ask spread to accept (wider = worse fill price)
-    max_spread: float = field(default_factory=lambda: float(os.getenv("MAX_SPREAD", "0.04")))
+    max_spread: float = field(default_factory=lambda: float(os.getenv("MAX_SPREAD", "0.10")))
 
     # Maximum edge to accept — suspiciously high edge usually means near-certain
     # markets (exact_c type) that escaped other filters; >30% edge had 50% WR
