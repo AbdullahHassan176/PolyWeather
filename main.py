@@ -67,11 +67,24 @@ def _load_open_condition_ids() -> set[str]:
                 continue
             try:
                 entry = json.loads(line)
-                if entry.get("won") is None:
+                # Only block re-entry for real live fills — dry_run entries
+                # are paper trades and we never actually hold those positions.
+                if entry.get("won") is None and entry.get("fill_status") == "filled":
                     open_ids.add(entry.get("condition_id", ""))
             except json.JSONDecodeError:
                 pass
     return open_ids
+
+
+_weather_client: WeatherClient | None = None
+
+
+def _get_weather_client() -> WeatherClient:
+    """Return a module-level WeatherClient singleton (cache persists across scans)."""
+    global _weather_client
+    if _weather_client is None:
+        _weather_client = WeatherClient()
+    return _weather_client
 
 
 def run_scan():
@@ -92,7 +105,7 @@ def run_scan():
 
     # ── Fetch markets ─────────────────────────────────────────────────────────
     pm = PolymarketClient()
-    wc = WeatherClient()
+    wc = _get_weather_client()
 
     try:
         markets = pm.get_weather_markets()
@@ -145,6 +158,9 @@ def run_scan():
             logger.debug(f"Skipping exact_c market: {market['question'][:65]}")
             continue
 
+        # The root cause of losses was YES bets (20% WR), not direction.
+        # Allow all directions but enforce NO-only after signal analysis.
+
         # ── Ensemble probability ──────────────────────────────────────────────
         city      = parsed["city"]
         tdate     = parsed["date"]
@@ -178,12 +194,26 @@ def run_scan():
         if signal is None:
             continue
 
+        # Only place NO bets — YES bets had 20% WR in backtesting
+        if signal.side == "YES":
+            logger.debug(f"Skipping YES signal: {market['question'][:60]}")
+            continue
+
         # ── Bid/ask spread (one order-book call per signal) ───────────────────
         spread_data = fetch_spread(signal.token_id, clob)
         signal.bid    = spread_data["bid"]
         signal.ask    = spread_data["ask"]
         signal.spread = spread_data["spread"]
         signal.volume_24h = float(market.get("volume_24hr", 0) or 0)
+
+        # Skip illiquid markets — wide spread means worse fill and signals
+        # that market makers aren't confident in the price
+        if signal.spread > cfg.max_spread:
+            logger.debug(
+                f"Spread too wide ({signal.spread:.3f} > {cfg.max_spread}) — skipping: "
+                f"{market['question'][:55]}"
+            )
+            continue
 
         # ── Budget check ──────────────────────────────────────────────────────
         if signal.bet_usdc > budget:
@@ -205,7 +235,6 @@ def run_scan():
         if filled and not cfg.dry_run:
             budget -= (actual_spent or signal.bet_usdc)
 
-    wc.close()
     logger.info(
         f"=== Scan complete: {signals} signal(s) from {len(markets)} markets "
         f"| budget remaining: ${budget:.2f} ==="

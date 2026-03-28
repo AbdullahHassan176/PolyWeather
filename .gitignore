@@ -5,3 +5,4 @@ __pycache__/
 polyweather.log
 weather_cache.json
 paper_trades.jsonl
+*.log

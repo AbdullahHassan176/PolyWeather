@@ -31,8 +31,16 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import sys
+
 import httpx
 from loguru import logger
+
+# Ensure the project root is on the path so weather.cities is importable
+# regardless of which directory the script is invoked from.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 LOG_FILE    = Path("paper_trades.jsonl")
 CLOB_BASE   = "https://clob.polymarket.com"
@@ -80,9 +88,13 @@ def _check_resolution(client: httpx.Client, condition_id: str) -> Optional[tuple
 
 def update_outcomes(entries: list[dict]) -> tuple[list[dict], int]:
     """Fetch resolution for all unresolved entries."""
-    pending = [e for e in entries if e.get("won") is None and e.get("fill_status") != "dry_run"]
+    pending = [
+        e for e in entries
+        if e.get("won") is None
+        and e.get("fill_status") in ("dry_run", "filled", None)
+    ]
     if not pending:
-        logger.info("No unresolved live/paper entries to check.")
+        logger.info("No unresolved entries to check.")
         return entries, 0
 
     logger.info(f"Checking {len(pending)} unresolved entries against CLOB...")
@@ -119,8 +131,7 @@ def _fetch_actual_temp(
     from the Open-Meteo historical archive API.
     Returns the temperature or None.
     """
-    from weather.cities import get_coordinates
-    coords = get_coordinates(city)
+    coords = _get_coordinates(city)
     if coords is None:
         return None
     lat, lon   = coords
@@ -138,6 +149,9 @@ def _fetch_actual_temp(
         return float(temps[0]) if temps else None
     except Exception:
         return None
+
+
+from weather.cities import get_coordinates as _get_coordinates  # noqa: E402
 
 
 def update_actual_temps(entries: list[dict]) -> tuple[list[dict], int]:
@@ -346,14 +360,17 @@ def main():
         entries, n_outcomes = update_outcomes(entries)
         if n_outcomes:
             logger.info(f"Resolved {n_outcomes} new outcome(s)")
+            _save(entries)  # save immediately — don't risk losing outcomes if actuals fetch fails
+            logger.info("Saved outcome updates to paper_trades.jsonl")
 
-        entries, n_actuals = update_actual_temps(entries)
-        if n_actuals:
-            logger.info(f"Fetched {n_actuals} actual temperature(s)")
-
-        if n_outcomes or n_actuals:
-            _save(entries)
-            logger.info("Saved updates to paper_trades.jsonl")
+        try:
+            entries, n_actuals = update_actual_temps(entries)
+            if n_actuals:
+                logger.info(f"Fetched {n_actuals} actual temperature(s)")
+                _save(entries)
+                logger.info("Saved actual temperature updates to paper_trades.jsonl")
+        except Exception as exc:
+            logger.warning(f"Actual temps fetch failed (non-fatal): {exc}")
 
     print_report(entries)
 

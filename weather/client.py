@@ -1,18 +1,21 @@
 """
 Weather client — fetches temperature forecasts from Open-Meteo.
 
-Primary source : ECMWF ensemble API (50-member, very accurate)
-Fallback       : Regular forecast API + normal-distribution synthetic ensemble
-
-The ensemble API is free but hourly-limited.  When it returns 429, we fall
-back to the regular API and approximate uncertainty with a calibrated σ based
-on the forecast horizon:
-  horizon ≤1d: σ=1.5°C, ≤2d: σ=2.0°C, ≤3d: σ=2.5°C, ≤5d: σ=3.0°C, else σ=4.0°C
+Source priority
+───────────────
+1. ECMWF ensemble API  (ensemble-api.open-meteo.com) — 50 members, most accurate
+2. GFS ensemble        (same endpoint, gfs_seamless)  — 30 members
+3. Forecast API        (api.open-meteo.com)           — different rate-limit pool,
+                       also supports ensemble models; tried when ensemble-api hits 429
+4. Synthetic fallback  — regular point forecast + normal-distribution ensemble,
+                       calibrated σ by horizon:
+                       ≤1d: σ=1.5°C, ≤2d: σ=2.0°C, ≤3d: σ=2.5°C, ≤5d: σ=3.0°C, else σ=4.0°C
 
 Cache strategy
 ──────────────
-Results are cached on disk (weather_cache.json) so each (city, date, unit)
-is fetched at most once per UTC day regardless of how many scans run.
+Results are cached on disk (weather_cache.json).  Entries are keyed by
+"city|target_date|unit" and kept until the target_date passes (>= today).
+This means each city+date combo is fetched at most once across all restarts.
 """
 import json
 import time
@@ -27,10 +30,11 @@ from loguru import logger
 from config import cfg
 from weather.cities import get_coordinates
 
-_REQUEST_DELAY = 1.5           # minimum seconds between API calls
-_RETRY_WAITS   = [15, 30]      # wait on 1st / 2nd 429 before giving up
+_REQUEST_DELAY = 3.0           # minimum seconds between API calls
 _CACHE_FILE    = Path("weather_cache.json")
 _REGULAR_API   = "https://api.open-meteo.com/v1/forecast"
+# Forecast API supports the same ensemble models under a separate rate-limit pool
+_FORECAST_ENSEMBLE_API = "https://api.open-meteo.com/v1/forecast"
 
 # Calibrated forecast RMSE by horizon (°C)
 _SIGMA_BY_HORIZON = [(1, 1.5), (2, 2.0), (3, 2.5), (5, 3.0), (999, 4.0)]
@@ -47,8 +51,8 @@ def _load_disk_cache() -> dict:
     try:
         data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
         today = _today_str()
-        # Only keep entries whose first date key matches today (rough expiry)
-        valid = {k: v for k, v in data.items() if k.split("|")[1] == today}
+        # Keep entries for today or future dates — discard past dates only
+        valid = {k: v for k, v in data.items() if k.split("|")[1] >= today}
         return valid
     except Exception:
         return {}
@@ -67,9 +71,8 @@ class WeatherClient:
         # In-memory cache: "city|date|unit" → list[float] | None
         self._cache: dict[str, Optional[list[float]]] = _load_disk_cache()
         self._last_request_time: float = 0.0
-        # Set to True when ensemble API returns "Hourly limit exceeded"
-        # so we skip retries for all subsequent cities in this process run
-        self._ensemble_hourly_blocked: bool = False
+        # Track which (endpoint, model) combos have hit their rate limit this session
+        self._blocked: set[str] = set()   # entries like "ensemble_api:ecmwf_ifs025"
         logger.debug(f"WeatherClient: loaded {len(self._cache)} entries from disk cache")
 
     def _throttle(self):
@@ -78,48 +81,43 @@ class WeatherClient:
             time.sleep(_REQUEST_DELAY - elapsed)
         self._last_request_time = time.monotonic()
 
-    # ── Ensemble (primary) ────────────────────────────────────────────────────
+    # ── Ensemble fetcher (used for both API endpoints) ────────────────────────
 
     def _fetch_ensemble(
-        self, lat: float, lon: float, target_date: date, temp_unit: str
+        self, lat: float, lon: float, target_date: date, temp_unit: str,
+        model: str, api_url: str
     ) -> Optional[list[float]]:
-        """Try ECMWF ensemble API.  Returns member temps or None on 429/error."""
-        if self._ensemble_hourly_blocked:
-            return None   # skip immediately — hourly limit already known
+        """
+        Fetch one ensemble model from the given API URL.
+        Returns member temps or None on 429/error.
+        Blocks the (api_url, model) pair on 429 so we don't retry it this session.
+        """
+        block_key = f"{api_url}:{model}"
+        if block_key in self._blocked:
+            return None
 
         params = {
             "latitude": lat, "longitude": lon,
             "daily": "temperature_2m_max",
-            "models": cfg.ensemble_model,
+            "models": model,
             "temperature_unit": temp_unit,
             "forecast_days": 16,
         }
-        resp = None
-        for attempt, wait in enumerate([0] + _RETRY_WAITS):
-            if wait:
-                logger.warning(f"Ensemble 429 — waiting {wait}s (attempt {attempt})")
-                time.sleep(wait)
-                self._last_request_time = time.monotonic()
-            self._throttle()
-            try:
-                resp = self._http.get(cfg.ensemble_api, params=params)
-            except httpx.HTTPError as exc:
-                logger.debug(f"Ensemble network error: {exc}")
-                return None
-            if resp.status_code == 429:
-                # Detect hourly limit — no point retrying any city
-                body = resp.text
-                if "Hourly" in body or "hourly" in body:
-                    logger.warning("Ensemble API hourly limit hit — switching to regular API for all cities")
-                    self._ensemble_hourly_blocked = True
-                    return None
-                if attempt < len(_RETRY_WAITS):
-                    continue
-                return None         # caller will try fallback
-            resp.raise_for_status()
-            break
+        if cfg.open_meteo_api_key:
+            params["apikey"] = cfg.open_meteo_api_key
+        self._throttle()
+        try:
+            resp = self._http.get(api_url, params=params)
+        except httpx.HTTPError as exc:
+            logger.debug(f"Ensemble network error ({model} @ {api_url}): {exc}")
+            return None
 
-        if resp is None or resp.status_code != 200:
+        if resp.status_code == 429:
+            logger.warning(f"{model} rate-limited (429) on {api_url} — blocked for this session")
+            self._blocked.add(block_key)
+            return None
+
+        if resp.status_code != 200:
             return None
 
         daily  = resp.json().get("daily", {})
@@ -156,6 +154,8 @@ class WeatherClient:
             "temperature_unit": temp_unit,
             "forecast_days": min(16, max(1, horizon_days + 1)),
         }
+        if cfg.open_meteo_api_key:
+            params["apikey"] = cfg.open_meteo_api_key
         self._throttle()
         try:
             resp = self._http.get(_REGULAR_API, params=params)
@@ -206,10 +206,30 @@ class WeatherClient:
         lat, lon   = coords
         temp_unit  = "fahrenheit" if unit == "F" else "celsius"
 
-        # Try ensemble first
-        members = self._fetch_ensemble(lat, lon, target_date, temp_unit)
+        # Try ensemble-api.open-meteo.com first (ECMWF + GFS = up to 80 members),
+        # then fall back to api.open-meteo.com (separate rate-limit pool),
+        # then synthetic normal-distribution fallback.
+        all_members: list[float] = []
+        for model in ("ecmwf_ifs025", "gfs_seamless"):
+            m = self._fetch_ensemble(lat, lon, target_date, temp_unit,
+                                     model=model, api_url=cfg.ensemble_api)
+            if m:
+                all_members.extend(m)
 
-        if members is None:
+        # If ensemble-api is exhausted, try forecast API (different rate-limit pool)
+        if not all_members:
+            for model in ("ecmwf_ifs025", "gfs_seamless"):
+                m = self._fetch_ensemble(lat, lon, target_date, temp_unit,
+                                         model=model, api_url=_FORECAST_ENSEMBLE_API)
+                if m:
+                    all_members.extend(m)
+            if all_members:
+                logger.debug(f"Forecast-API ensemble: {len(all_members)} members for {city}")
+
+        if all_members:
+            members = all_members
+            logger.debug(f"Multi-model ensemble: {len(members)} members for {city}")
+        else:
             logger.info(f"Ensemble unavailable for {city} — using regular-API fallback")
             members = self._fetch_regular(lat, lon, target_date, temp_unit)
 
@@ -246,12 +266,15 @@ class WeatherClient:
         coords = get_coordinates(city)
         temp_unit = "fahrenheit" if unit == "F" else "celsius"
 
-        # Determine which method was used (ensemble has 50 members, fallback also 50
-        # but they're synthetic; we distinguish by checking if ensemble was blocked)
-        if self._ensemble_hourly_blocked:
-            method = "regular_fallback"
+        all_ensemble_blocked = all(
+            f"{cfg.ensemble_api}:{m}" in self._blocked and
+            f"{_FORECAST_ENSEMBLE_API}:{m}" in self._blocked
+            for m in ("ecmwf_ifs025", "gfs_seamless")
+        )
+        if all_ensemble_blocked or len(temps) <= 50:
+            method = "regular_fallback" if all_ensemble_blocked else "ensemble"
         else:
-            method = "ensemble"
+            method = "multi_model"
 
         return {
             "method": method,

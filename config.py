@@ -45,11 +45,26 @@ class Config:
     kelly_fraction: float = field(default_factory=lambda: float(os.getenv("KELLY_FRACTION", "0.25")))
     dry_run: bool = field(default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true")
 
+    # Maximum bid-ask spread to accept (wider = worse fill price)
+    max_spread: float = field(default_factory=lambda: float(os.getenv("MAX_SPREAD", "0.04")))
+
+    # Maximum edge to accept — suspiciously high edge usually means near-certain
+    # markets (exact_c type) that escaped other filters; >30% edge had 50% WR
+    max_edge: float = field(default_factory=lambda: float(os.getenv("MAX_EDGE", "0.30")))
+
+    # Extra edge required for high-variability cities (Wellington, Chicago, etc.)
+    high_variability_extra_edge: float = field(
+        default_factory=lambda: float(os.getenv("HIGH_VARIABILITY_EXTRA_EDGE", "0.05"))
+    )
+
     # ── Timing ────────────────────────────────────────────────────────────────
     scan_interval: int = field(default_factory=lambda: int(os.getenv("SCAN_INTERVAL", "300")))
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+
+    # ── Open-Meteo API key (optional — register free at open-meteo.com for higher limits) ──
+    open_meteo_api_key: str = field(default_factory=lambda: os.getenv("OPEN_METEO_API_KEY", ""))
 
     # ── API endpoints (hardcoded) ──────────────────────────────────────────────
     gamma_api: str = "https://gamma-api.polymarket.com"

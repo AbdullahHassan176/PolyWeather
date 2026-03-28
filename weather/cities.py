@@ -153,6 +153,21 @@ CITIES: dict[str, tuple[float, float]] = {
 }
 
 
+# Cities with notoriously high weather variability where ensemble skill is lower.
+# The strategy requires a higher edge threshold before betting on these.
+HIGH_VARIABILITY_CITIES: frozenset[str] = frozenset({
+    "Wellington",   # windiest capital city on earth, rapid frontal changes
+    "Auckland",     # maritime NZ, high inter-day variability
+    "Chicago",      # "Windy City", strong lake-effect swings
+    "Denver",       # high-elevation, rapid temperature reversals
+    "Calgary",      # chinook winds cause sudden 20°C swings
+    "Cheyenne",     # similar to Denver
+    "Butte",        # high-elevation MT, extreme variability
+    "Christchurch", # NZ, exposed to Southern Ocean fronts
+    "Hobart",       # similar exposure
+})
+
+
 def get_coordinates(city: str) -> tuple[float, float] | None:
     """Return (lat, lon) for a city name, with fuzzy matching."""
     # Exact match first

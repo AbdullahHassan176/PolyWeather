@@ -8,7 +8,7 @@ from config import cfg
 
 
 # Minimum 24-hour CLOB volume (USDC) to bother with a market
-MIN_VOLUME_24H = 500.0
+MIN_VOLUME_24H = 1000.0
 
 
 class PolymarketClient:
@@ -120,8 +120,10 @@ class PolymarketClient:
         if not raw.get("acceptingOrders", False):
             return None
 
-        # Skip markets that have already effectively resolved (price near 0 or 1)
-        if yes_price < 0.01 or yes_price > 0.99:
+        # Skip markets where either token is near-certain (< 5¢ or > 95¢).
+        # Betting the cheap side at 1–4¢ is extremely high-variance and the
+        # ensemble can't reliably model near-0 probability events.
+        if yes_price < 0.05 or yes_price > 0.95:
             return None
 
         volume_24hr = float(

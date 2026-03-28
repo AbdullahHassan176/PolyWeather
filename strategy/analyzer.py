@@ -5,6 +5,17 @@ from typing import Optional
 from loguru import logger
 
 from config import cfg
+from weather.cities import HIGH_VARIABILITY_CITIES
+
+# Minimum edge multiplier by forecast horizon (days out).
+# Longer horizons = more uncertainty = need more edge to justify the bet.
+_HORIZON_EDGE_SCALE = [
+    (1, 1.0),   # same-day / next-day: standard MIN_EDGE
+    (2, 1.3),   # 2 days out: 30% higher bar
+    (3, 1.6),   # 3 days out: 60% higher bar
+    (5, 2.0),   # 4-5 days: double the bar
+    (999, 2.5), # 6+ days: very conservative
+]
 
 
 @dataclass
@@ -68,9 +79,32 @@ def analyze(
 
     best_edge = max(edge_yes, edge_no)
 
-    if best_edge < cfg.min_edge:
+    # Scale the required edge by forecast horizon and city variability
+    tdate = parsed.get("date")
+    horizon_days = (tdate - date.today()).days if tdate else 0
+    scale = next(s for h, s in _HORIZON_EDGE_SCALE if horizon_days <= h)
+    required_edge = cfg.min_edge * scale
+
+    # Synthetic fallback (regular_fallback) has wider σ → probabilities are less
+    # extreme → edges are smaller. Lower the bar by 40% when fallback is used so
+    # we still find signals. Calibration showed 92.3% WR on 5-10% edge trades.
+    fm = forecast_meta or {}
+    if fm.get("method") == "regular_fallback":
+        required_edge *= 0.60
+
+    city = parsed.get("city", "")
+    if city in HIGH_VARIABILITY_CITIES:
+        required_edge += cfg.high_variability_extra_edge
+
+    if best_edge < required_edge:
         logger.debug(
-            f"No edge ({best_edge:.3f} < {cfg.min_edge}) on: {market['question'][:60]}"
+            f"No edge ({best_edge:.3f} < {required_edge:.3f} req) on: {market['question'][:60]}"
+        )
+        return None
+
+    if best_edge > cfg.max_edge:
+        logger.debug(
+            f"Edge too high ({best_edge:.3f} > {cfg.max_edge:.3f} cap) — likely mispriced: {market['question'][:60]}"
         )
         return None
 
@@ -96,6 +130,12 @@ def analyze(
         logger.debug(
             f"Bet too small (${bet_usdc:.2f} < $5 CLOB min) for: {market['question'][:60]}"
         )
+        return None
+
+    # Hard floor: never buy a token priced below 5¢ — the market is near-certain
+    # and our ensemble probability estimates are unreliable that close to 0/1.
+    if price < 0.05:
+        logger.debug(f"Price too low ({price:.3f}) — near-certain market, skipping")
         return None
 
     logger.info(
