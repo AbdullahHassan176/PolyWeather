@@ -5,9 +5,7 @@ Source priority
 ───────────────
 1. ECMWF ensemble API  (ensemble-api.open-meteo.com) — 50 members, most accurate
 2. GFS ensemble        (same endpoint, gfs_seamless)  — 30 members
-3. Forecast API        (api.open-meteo.com)           — different rate-limit pool,
-                       also supports ensemble models; tried when ensemble-api hits 429
-4. Synthetic fallback  — regular point forecast + normal-distribution ensemble,
+3. Synthetic fallback  — regular point forecast + normal-distribution ensemble,
                        calibrated σ by horizon:
                        ≤1d: σ=1.5°C, ≤2d: σ=2.0°C, ≤3d: σ=2.5°C, ≤5d: σ=3.0°C, else σ=4.0°C
 
@@ -33,8 +31,6 @@ from weather.cities import get_coordinates
 _REQUEST_DELAY = 3.0           # minimum seconds between API calls
 _CACHE_FILE    = Path("weather_cache.json")
 _REGULAR_API   = "https://api.open-meteo.com/v1/forecast"
-# Forecast API supports the same ensemble models under a separate rate-limit pool
-_FORECAST_ENSEMBLE_API = "https://api.open-meteo.com/v1/forecast"
 
 # Calibrated forecast RMSE by horizon (°C)
 _SIGMA_BY_HORIZON = [(1, 1.5), (2, 2.0), (3, 2.5), (5, 3.0), (999, 4.0)]
@@ -206,25 +202,14 @@ class WeatherClient:
         lat, lon   = coords
         temp_unit  = "fahrenheit" if unit == "F" else "celsius"
 
-        # Try ensemble-api.open-meteo.com first (ECMWF + GFS = up to 80 members),
-        # then fall back to api.open-meteo.com (separate rate-limit pool),
-        # then synthetic normal-distribution fallback.
+        # Try ECMWF (50 members) + GFS (30 members) from ensemble-api.open-meteo.com.
+        # Falls back to synthetic normal-distribution if rate-limited/unavailable.
         all_members: list[float] = []
         for model in ("ecmwf_ifs025", "gfs_seamless"):
             m = self._fetch_ensemble(lat, lon, target_date, temp_unit,
                                      model=model, api_url=cfg.ensemble_api)
             if m:
                 all_members.extend(m)
-
-        # If ensemble-api is exhausted, try forecast API (different rate-limit pool)
-        if not all_members:
-            for model in ("ecmwf_ifs025", "gfs_seamless"):
-                m = self._fetch_ensemble(lat, lon, target_date, temp_unit,
-                                         model=model, api_url=_FORECAST_ENSEMBLE_API)
-                if m:
-                    all_members.extend(m)
-            if all_members:
-                logger.debug(f"Forecast-API ensemble: {len(all_members)} members for {city}")
 
         if all_members:
             members = all_members
@@ -267,8 +252,7 @@ class WeatherClient:
         temp_unit = "fahrenheit" if unit == "F" else "celsius"
 
         all_ensemble_blocked = all(
-            f"{cfg.ensemble_api}:{m}" in self._blocked and
-            f"{_FORECAST_ENSEMBLE_API}:{m}" in self._blocked
+            f"{cfg.ensemble_api}:{m}" in self._blocked
             for m in ("ecmwf_ifs025", "gfs_seamless")
         )
         if all_ensemble_blocked or len(temps) <= 50:
