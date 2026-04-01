@@ -252,95 +252,96 @@ def _breakdown(entries: list[dict], key_fn, title: str, top_n: int = 20) -> None
 
 # ── Main report ───────────────────────────────────────────────────────────────
 
-def print_report(entries: list[dict]) -> None:
-    W    = 70
-    dsep = "=" * W
-    sep  = "-" * W
-
-    # Consider only dry_run and filled entries for the report (skip unfilled)
-    paper = [e for e in entries if e.get("fill_status") in ("dry_run", "filled", None)]
-    resolved  = [e for e in paper if e.get("won") is not None]
-    pending   = [e for e in paper if e.get("won") is None]
-
-    print(f"\n{dsep}")
-    print(f"  PolyWeather Paper-Trade Report  ({len(paper)} signals total)")
-    print(dsep)
-    print(f"  Resolved : {len(resolved)}    Pending  : {len(pending)}")
-
-    if not resolved:
-        print("  No resolved trades yet.")
-        print("  Temperature markets close ~noon UTC the day after the target date.")
-        print(f"{dsep}\n")
-        return
-
-    wins     = sum(1 for e in resolved if e["won"])
-    losses   = len(resolved) - wins
-    win_rate = wins / len(resolved)
-
-    # Simulated P&L
+def _print_section(title: str, resolved: list[dict], pending: list[dict], sep: str, dsep: str) -> None:
+    """Print a self-contained report section for a cohort of trades."""
+    wins        = sum(1 for e in resolved if e["won"])
+    losses      = len(resolved) - wins
+    win_rate    = wins / len(resolved) if resolved else 0
+    total_staked = sum(e["bet_usdc"] for e in resolved)
     pnl = sum(
         e["bet_usdc"] * (1 - e["market_price"]) / max(e["market_price"], 0.001)
         if e["won"] else -e["bet_usdc"]
         for e in resolved
     )
-    total_staked = sum(e["bet_usdc"] for e in resolved)
-    roi          = pnl / total_staked if total_staked else 0
+    roi = pnl / total_staked if total_staked else 0
 
-    print(f"\n  Wins      : {wins}")
-    print(f"  Losses    : {losses}")
-    print(f"  Win rate  : {win_rate:.1%}")
-    print(f"  Staked    : ${total_staked:.2f}")
-    print(f"  Sim P&L   : ${pnl:+.2f}  (ROI {roi:+.1%})")
+    print(f"\n{dsep}")
+    print(f"  {title}")
+    print(dsep)
+    print(f"  Resolved : {len(resolved)}    Pending : {len(pending)}")
+    if not resolved:
+        print("  No resolved trades yet.")
+        return
+    print(f"  Wins     : {wins}    Losses  : {losses}    Win rate : {win_rate:.1%}")
+    print(f"  Staked   : ${total_staked:.2f}")
+    print(f"  P&L      : ${pnl:+.2f}  (ROI {roi:+.1%})")
 
-    # ── Forecast vs actual calibration ────────────────────────────────────────
-    actuals = [e for e in resolved if e.get("actual_temp") is not None]
+    # Open positions
+    if pending:
+        print(f"\n  OPEN POSITIONS ({len(pending)})")
+        for e in sorted(pending, key=lambda x: x.get("target_date", "")):
+            print(f"    {e.get('target_date','?')[:10]}  ${e['bet_usdc']:.2f}  {e.get('our_side','?')}  {e.get('question','')[:60]}")
+
+    # Breakdowns — only meaningful with enough data
+    if len(resolved) >= 10:
+        _breakdown(resolved, lambda e: e.get("direction", "unknown"), "BY DIRECTION")
+        _breakdown(resolved, lambda e: e.get("city", "unknown"), "BY CITY (top 10)", top_n=10)
+        _breakdown(resolved, lambda e: _edge_bucket(e.get("edge", 0)), "BY EDGE SIZE")
+
+    # Worst losses
+    worst = sorted([e for e in resolved if not e["won"]], key=lambda x: -x["bet_usdc"])[:5]
+    if worst:
+        print(f"\n  WORST LOSSES")
+        for e in worst:
+            print(f"    ${e['bet_usdc']:>5.2f}  {e.get('our_side','?')}  edge={e.get('edge',0):.3f}  {e.get('question','')[:60]}")
+
+
+def print_report(entries: list[dict]) -> None:
+    W    = 70
+    dsep = "=" * W
+    sep  = "-" * W
+
+    all_tracked = [e for e in entries if e.get("fill_status") in ("dry_run", "filled", None)]
+
+    live_all  = [e for e in all_tracked if e.get("fill_status") == "filled"]
+    paper_all = [e for e in all_tracked if e.get("fill_status") != "filled"]
+
+    live_res  = [e for e in live_all  if e.get("won") is not None]
+    live_pen  = [e for e in live_all  if e.get("won") is None]
+    paper_res = [e for e in paper_all if e.get("won") is not None]
+    paper_pen = [e for e in paper_all if e.get("won") is None]
+
+    # ── LIVE TRADES ───────────────────────────────────────────────────────────
+    _print_section("LIVE TRADES (real money)", live_res, live_pen, sep, dsep)
+
+    # ── PAPER TRADES (historical reference only) ──────────────────────────────
+    print(f"\n{dsep}")
+    print(f"  PAPER / SIMULATION TRADES  (historical reference — not real money)")
+    print(dsep)
+    print(f"  Resolved : {len(paper_res)}    Pending : {len(paper_pen)}")
+    if paper_res:
+        pw   = sum(1 for e in paper_res if e["won"])
+        ppnl = sum(
+            e["bet_usdc"] * (1 - e["market_price"]) / max(e["market_price"], 0.001)
+            if e["won"] else -e["bet_usdc"]
+            for e in paper_res
+        )
+        pstk = sum(e["bet_usdc"] for e in paper_res)
+        print(f"  Wins     : {pw}    Losses  : {len(paper_res)-pw}    Win rate : {pw/len(paper_res):.1%}")
+        print(f"  Sim P&L  : ${ppnl:+.2f}  (ROI {ppnl/pstk:+.1%})  [simulated, not real]")
+
+    # ── Forecast calibration (uses all resolved data) ─────────────────────────
+    all_res = live_res + paper_res
+    actuals = [e for e in all_res if e.get("actual_temp") is not None]
     if actuals:
         print(f"\n  {sep}")
         print(f"  FORECAST CALIBRATION (n={len(actuals)} with actual temps)")
         print(f"  {'Market':<40}  {'Pred':>6}  {'Actual':>7}  {'Error':>7}")
-        for e in sorted(actuals, key=lambda x: x.get("target_date", ""))[:15]:
+        for e in sorted(actuals, key=lambda x: x.get("target_date", ""))[-10:]:
             pred = e.get("forecast_mean", 0)
             act  = e["actual_temp"]
-            err  = pred - act
             u    = e.get("unit", "")
-            print(f"  {e['question'][:40]:<40}  {pred:>5.1f}{u}  {act:>6.1f}{u}  {err:>+6.1f}{u}")
-
-    # ── Breakdowns ─────────────────────────────────────────────────────────────
-    _breakdown(resolved, lambda e: e.get("our_side", "?"),
-               "BY SIDE")
-    _breakdown(resolved, lambda e: _edge_bucket(e.get("edge", 0)),
-               "BY EDGE SIZE")
-    _breakdown(resolved, lambda e: e.get("forecast_method", "unknown"),
-               "BY FORECAST METHOD")
-    _breakdown(resolved, lambda e: _horizon_bucket(e.get("forecast_horizon_days", 0)),
-               "BY FORECAST HORIZON")
-    _breakdown(resolved, lambda e: e.get("direction", "unknown"),
-               "BY MARKET DIRECTION")
-    _breakdown(resolved, lambda e: _spread_bucket(e.get("spread", 0)),
-               "BY BID-ASK SPREAD (liquidity)")
-    _breakdown(resolved, lambda e: e.get("city", "unknown"),
-               "BY CITY (top 15)", top_n=15)
-
-    # ── Calibration table ──────────────────────────────────────────────────────
-    print(f"\n  {sep}")
-    print(f"  PROBABILITY CALIBRATION  (our_prob vs actual win rate)")
-    print(f"  {sep}")
-    print(f"  {'Our prob':>10}  {'N':>4}  {'Wins':>5}  {'Actual WR':>10}  {'Expected WR':>12}")
-    for label, n, wins_c, avg_p in _calibration_buckets(resolved):
-        wr = wins_c / n
-        print(f"  {label:>10}  {n:>4}  {wins_c:>5}  {wr:>10.1%}  {avg_p:>12.1%}")
-
-    # ── Worst losses ──────────────────────────────────────────────────────────
-    worst = sorted([e for e in resolved if not e["won"]], key=lambda x: -x["bet_usdc"])[:8]
-    if worst:
-        print(f"\n  {sep}")
-        print(f"  WORST LOSSES (investigate for model bugs)")
-        for e in worst:
-            print(
-                f"    ${e['bet_usdc']:>5.2f}  {e['our_side']:>3s}  "
-                f"edge={e['edge']:.3f}  horizon={e.get('forecast_horizon_days','?')}d  "
-                f"{e['question'][:52]}"
-            )
+            print(f"  {e['question'][:40]:<40}  {pred:>5.1f}{u}  {act:>6.1f}{u}  {pred-act:>+6.1f}{u}")
 
     print(f"\n{dsep}\n")
 

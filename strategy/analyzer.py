@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -10,11 +11,10 @@ from weather.cities import HIGH_VARIABILITY_CITIES
 # Minimum edge multiplier by forecast horizon (days out).
 # Longer horizons = more uncertainty = need more edge to justify the bet.
 _HORIZON_EDGE_SCALE = [
-    (1, 1.0),   # same-day / next-day: standard MIN_EDGE
-    (2, 1.3),   # 2 days out: 30% higher bar
-    (3, 1.6),   # 3 days out: 60% higher bar
-    (5, 2.0),   # 4-5 days: double the bar
-    (999, 2.5), # 6+ days: very conservative
+    (2, 1.0),   # 2 days out: standard MIN_EDGE (our minimum allowed horizon)
+    (3, 1.3),   # 3 days out: 30% higher bar
+    (5, 1.6),   # 4-5 days: 60% higher bar
+    (999, 2.0), # 6+ days: double the bar
 ]
 
 
@@ -93,7 +93,11 @@ def analyze(
         required_edge *= 0.60
 
     city = parsed.get("city", "")
-    if city in HIGH_VARIABILITY_CITIES:
+    # Skip variability penalty for "between" direction in paper mode — it was designed
+    # for above/below trades and data doesn't support applying it to "between" specifically.
+    _is_between = parsed.get("direction") == "between"
+    _skip_variability = _is_between and bool(int(os.getenv("PAPER_MODE", "0")))
+    if city in HIGH_VARIABILITY_CITIES and not _skip_variability:
         required_edge += cfg.high_variability_extra_edge
 
     if best_edge < required_edge:
@@ -136,6 +140,13 @@ def analyze(
     # and our ensemble probability estimates are unreliable that close to 0/1.
     if price < 0.05:
         logger.debug(f"Price too low ({price:.3f}) — near-certain market, skipping")
+        return None
+
+    # For NO bets: require NO token price >= 0.75 (market gives at least 25% YES).
+    # Data: 70-75c band loses despite 75% WR (both clean-strategy losses came from here).
+    # 75-80c and 80-90c bands are 100% WR in clean universe (+$26 combined).
+    if side == "NO" and price < 0.75:
+        logger.debug(f"NO token price too low ({price:.3f} < 0.75) — below profitable band, skipping")
         return None
 
     logger.info(

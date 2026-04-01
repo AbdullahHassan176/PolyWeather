@@ -30,6 +30,7 @@ def record_signal(
     signal: "TradeSignal",
     fill_status: Optional[str] = None,
     actual_spent: Optional[float] = None,
+    log_file: Optional[Path] = None,
 ) -> None:
     """
     Append one fully-detailed signal record to paper_trades.jsonl.
@@ -85,5 +86,6 @@ def record_signal(
         "won":          None,
         "actual_temp":  None,   # filled by actuals fetcher after resolution
     }
-    with LOG_FILE.open("a", encoding="utf-8") as f:
+    target = log_file if log_file is not None else LOG_FILE
+    with target.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")

@@ -16,6 +16,7 @@ Usage:
   py -3.11 main.py
 """
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -23,6 +24,44 @@ from pathlib import Path
 
 import schedule
 from loguru import logger
+
+_PAPER_MODE = "--paper" in sys.argv   # experimental paper-trading with looser filters
+
+if _PAPER_MODE:
+    os.environ["DRY_RUN"]    = "true"   # never place real orders in paper mode
+    os.environ["PAPER_MODE"] = "1"      # signal analyzer to skip variability penalty
+
+_LOCKFILE       = Path("polyweather_paper.pid" if _PAPER_MODE else "polyweather.pid")
+_LOG_FILE       = "polyweather_paper.log"      if _PAPER_MODE else "polyweather.log"
+_TRADES_FILE    = Path("paper_trades_experimental.jsonl" if _PAPER_MODE else "paper_trades.jsonl")
+
+
+def _acquire_lock() -> bool:
+    """Return True if this process acquired the singleton lock, False if another instance is running."""
+    if _LOCKFILE.exists():
+        try:
+            existing_pid = int(_LOCKFILE.read_text().strip())
+            # Check if that PID is still alive
+            try:
+                os.kill(existing_pid, 0)
+                # Process exists — another instance is running
+                print(f"[polyweather] Another instance already running (PID {existing_pid}). Exiting.", flush=True)
+                return False
+            except (OSError, SystemError):
+                # Stale lock file — previous process died without cleanup
+                # (SystemError can occur on Windows when signal 0 is unsupported)
+                pass
+        except (ValueError, IOError):
+            pass
+    _LOCKFILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_lock():
+    try:
+        _LOCKFILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 from config import cfg
 from polymarket.markets import PolymarketClient
@@ -43,7 +82,7 @@ def _configure_logging():
         colorize=True,
     )
     logger.add(
-        "polyweather.log",
+        _LOG_FILE,
         level="DEBUG",
         rotation="10 MB",
         retention="14 days",
@@ -56,7 +95,7 @@ def _load_open_condition_ids() -> set[str]:
     Return conditionIds that have been signalled but not yet resolved.
     Used to avoid re-entering positions we already hold.
     """
-    log_path = Path("paper_trades.jsonl")
+    log_path = _TRADES_FILE
     if not log_path.exists():
         return set()
     open_ids: set[str] = set()
@@ -67,9 +106,18 @@ def _load_open_condition_ids() -> set[str]:
                 continue
             try:
                 entry = json.loads(line)
-                # Only block re-entry for real live fills — dry_run entries
-                # are paper trades and we never actually hold those positions.
-                if entry.get("won") is None and entry.get("fill_status") == "filled":
+                # Block re-entry based on fill_status:
+                #   "filled"        — position held, don't double up
+                #   "delayed"       — order queued on CLOB, WILL fill on-chain;
+                #                     retrying creates duplicates (Taipei root cause)
+                #   "error"         — order may have reached CLOB despite exception;
+                #                     don't retry to avoid unknown duplicate positions
+                # Allow retry for:
+                #   "slippage_abort"  — order never sent, price may recover
+                #   "fok_unmatched"   — order rejected by book, safe to retry
+                #   "dry_run"         — paper trade only, no real position
+                status = entry.get("fill_status")
+                if entry.get("won") is None and status in ("filled", "delayed", "error", "dry_run"):
                     open_ids.add(entry.get("condition_id", ""))
             except json.JSONDecodeError:
                 pass
@@ -87,11 +135,51 @@ def _get_weather_client() -> WeatherClient:
     return _weather_client
 
 
+_LIVE_TRADING_THRESHOLD = 30  # clean resolved trades needed before going live
+
+
+def _count_clean_resolved() -> int:
+    """Count resolved trades matching the current clean strategy criteria."""
+    log_path = Path("paper_trades.jsonl")
+    if not log_path.exists():
+        return 0
+    count = 0
+    with log_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                if (e.get("direction") == "between"
+                        and e.get("our_side") == "NO"
+                        and e.get("forecast_horizon_days", 0) >= 2
+                        and e.get("edge", 0) >= 0.15
+                        and e.get("market_price", 0) >= 0.75
+                        and e.get("won") is not None):
+                    count += 1
+            except json.JSONDecodeError:
+                pass
+    return count
+
+
 def run_scan():
     logger.info("=== Scan started ===")
 
     # ── Build shared CLOB client (cached after first call) ────────────────────
     clob = build_clob_client()
+
+    # ── Live-readiness check ──────────────────────────────────────────────────
+    if cfg.dry_run:
+        clean_n = _count_clean_resolved()
+        if clean_n >= _LIVE_TRADING_THRESHOLD:
+            logger.warning(
+                f"*** READY FOR LIVE TRADING: {clean_n} clean resolved trades "
+                f"(>= {_LIVE_TRADING_THRESHOLD}). "
+                f"Set DRY_RUN=false and MAX_TRADE_USDC=40 in .env to go live. ***"
+            )
+        else:
+            logger.info(f"Paper trading: {clean_n}/{_LIVE_TRADING_THRESHOLD} clean resolved trades")
 
     # ── Budget guard ──────────────────────────────────────────────────────────
     if not cfg.dry_run:
@@ -152,14 +240,25 @@ def run_scan():
             logger.debug(f"Resolves today/past, skipping: {market['question'][:65]}")
             continue
 
+        # Skip 1-day horizon unless in experimental paper mode testing 1d between trades.
+        # Live: backtesting shows 1d trades are consistently unprofitable (-$206 P&L).
+        # Paper: testing whether 1d "between" specifically is viable (ECMWF more accurate at 1d).
+        _min_horizon = 1 if _PAPER_MODE else 2
+        if parsed.get("date") and (parsed["date"] - today_utc).days < _min_horizon:
+            logger.debug(f"Horizon too short (<{_min_horizon}d), skipping: {market['question'][:65]}")
+            continue
+
         # Skip exact-temperature markets ("be 17°C on ...") — the ±0.5°C band
         # is too narrow for ECMWF to be reliable; all backtested losses came from here
         if parsed.get("direction") == "exact_c":
             logger.debug(f"Skipping exact_c market: {market['question'][:65]}")
             continue
 
-        # The root cause of losses was YES bets (20% WR), not direction.
-        # Allow all directions but enforce NO-only after signal analysis.
+        # Only trade "between" direction — the only profitable segment in backtesting.
+        # above/below thresholds (-$45/-$21) and exact_c (-$4) all lose money.
+        if parsed.get("direction") != "between":
+            logger.debug(f"Skipping non-between direction ({parsed.get('direction')}): {market['question'][:55]}")
+            continue
 
         # ── Ensemble probability ──────────────────────────────────────────────
         city      = parsed["city"]
@@ -223,8 +322,9 @@ def run_scan():
         # ── Execute (or dry-run) ──────────────────────────────────────────────
         filled, fill_status, actual_spent = execute_trade(signal, clob_client=clob)
 
-        # Record with all metadata
-        record_signal(signal, fill_status=fill_status, actual_spent=actual_spent)
+        # Record with all metadata (use experimental file in paper mode)
+        record_signal(signal, fill_status=fill_status, actual_spent=actual_spent,
+                      log_file=_TRADES_FILE)
 
         if filled and not cfg.dry_run:
             budget -= (actual_spent or signal.bet_usdc)
@@ -236,6 +336,16 @@ def run_scan():
 
 
 def main():
+    if not _acquire_lock():
+        sys.exit(0)
+
+    try:
+        _run()
+    finally:
+        _release_lock()
+
+
+def _run():
     _configure_logging()
 
     logger.info("PolyWeather Bot starting")

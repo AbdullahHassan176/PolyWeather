@@ -26,6 +26,7 @@ _POLYGON_CHAIN_ID = 137
 # Maximum price the order is allowed to fill above our calculated price.
 # Protects against residual Gamma-price staleness after CLOB enrichment.
 _MAX_SLIPPAGE = 0.05   # 5 cents per share
+_HARD_MAX_BET = 20.0   # absolute hard cap — never send more than this regardless of config
 
 # Module-level client cache — built once per process, reused across scans.
 _clob_client = None
@@ -162,6 +163,12 @@ def execute_trade(
 
         client = clob_client or build_clob_client()
 
+        # Hard cap — belt-and-suspenders regardless of config or Kelly output
+        bet_amount = min(signal.bet_usdc, _HARD_MAX_BET)
+        if bet_amount < signal.bet_usdc:
+            logger.warning(f"Bet capped from ${signal.bet_usdc:.2f} to ${bet_amount:.2f} (hard max ${_HARD_MAX_BET})")
+            signal.bet_usdc = bet_amount
+
         order_args = MarketOrderArgs(
             token_id=signal.token_id,
             amount=signal.bet_usdc,   # USDC to spend (BUY side)
@@ -185,7 +192,7 @@ def execute_trade(
                 f"(delta={signal.slippage:.4f} > {_MAX_SLIPPAGE})  "
                 f"'{signal.market_question[:55]}'"
             )
-            return False, "unfilled", None
+            return False, "slippage_abort", None
 
         resp = client.post_order(order, OrderType.FOK)
         filled, detail = _parse_fok_response(resp)
@@ -208,10 +215,21 @@ def execute_trade(
                 f"Order not filled: '{signal.market_question[:55]}'  {detail}"
             )
 
-        return filled, ("filled" if filled else "unfilled"), actual_spent
+        # Preserve CLOB status so dedup can act correctly:
+        #   "filled"       — confirmed MATCHED, position held
+        #   "delayed"      — order queued on-chain, WILL fill later; must not retry
+        #   "fok_unmatched"— no liquidity, order rejected; safe to retry next scan
+        if filled:
+            fs = "filled"
+        elif "delayed" in detail:
+            fs = "delayed"
+        else:
+            fs = "fok_unmatched"
+        return filled, fs, actual_spent
 
     except Exception as exc:
         logger.error(
             f"Trade execution error for '{signal.market_question[:55]}': {exc}"
         )
-        return False, "unfilled", None
+        # "error" status — order may or may not have reached CLOB; block retry
+        return False, "error", None
