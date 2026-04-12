@@ -12,7 +12,7 @@ from weather.cities import HIGH_VARIABILITY_CITIES
 # Longer horizons = more uncertainty = need more edge to justify the bet.
 _HORIZON_EDGE_SCALE = [
     (2, 1.0),   # 2 days out: standard MIN_EDGE (our minimum allowed horizon)
-    (3, 1.3),   # 3 days out: 30% higher bar
+    (3, 1.15),  # 3 days out: 15% higher bar
     (5, 1.6),   # 4-5 days: 60% higher bar
     (999, 2.0), # 6+ days: double the bar
 ]
@@ -93,11 +93,11 @@ def analyze(
         required_edge *= 0.60
 
     city = parsed.get("city", "")
-    # Skip variability penalty for "between" direction in paper mode — it was designed
-    # for above/below trades and data doesn't support applying it to "between" specifically.
+    # Skip variability penalty for "between" direction — it was designed for above/below
+    # trades and data (160 resolved trades, 95.8% WR) does not support applying it to
+    # "between" specifically. Chicago/Denver both performing well without the penalty.
     _is_between = parsed.get("direction") == "between"
-    _skip_variability = _is_between and bool(int(os.getenv("PAPER_MODE", "0")))
-    if city in HIGH_VARIABILITY_CITIES and not _skip_variability:
+    if city in HIGH_VARIABILITY_CITIES and not _is_between:
         required_edge += cfg.high_variability_extra_edge
 
     if best_edge < required_edge:
@@ -142,11 +142,11 @@ def analyze(
         logger.debug(f"Price too low ({price:.3f}) — near-certain market, skipping")
         return None
 
-    # For NO bets: require NO token price >= 0.75 (market gives at least 25% YES).
-    # Data: 70-75c band loses despite 75% WR (both clean-strategy losses came from here).
-    # 75-80c and 80-90c bands are 100% WR in clean universe (+$26 combined).
-    if side == "NO" and price < 0.75:
-        logger.debug(f"NO token price too low ({price:.3f} < 0.75) — below profitable band, skipping")
+    # For NO bets: require NO token price >= 0.83.
+    # Data: 0.83-0.85 band is 100% WR. 0.78-0.83 band is marginally profitable at best,
+    # and the 0.81-0.82 sub-band showed 25% WR (-$22). Higher floor = lower breakeven needed.
+    if side == "NO" and price < 0.83:
+        logger.debug(f"NO token price too low ({price:.3f} < 0.83) — below profitable band, skipping")
         return None
 
     logger.info(

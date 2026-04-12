@@ -26,7 +26,7 @@ _POLYGON_CHAIN_ID = 137
 # Maximum price the order is allowed to fill above our calculated price.
 # Protects against residual Gamma-price staleness after CLOB enrichment.
 _MAX_SLIPPAGE = 0.05   # 5 cents per share
-_HARD_MAX_BET = 20.0   # absolute hard cap — never send more than this regardless of config
+_HARD_MAX_BET = 40.0   # absolute hard cap — never send more than this regardless of config
 
 # Module-level client cache — built once per process, reused across scans.
 _clob_client = None

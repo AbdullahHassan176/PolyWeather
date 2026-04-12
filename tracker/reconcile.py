@@ -243,8 +243,8 @@ def _breakdown(entries: list[dict], key_fn, title: str, top_n: int = 20) -> None
         wr   = wins / n
         avg_edge = sum(e.get("edge", 0) for e in es) / n
         pnl  = sum(
-            e["bet_usdc"] * (1 - e["market_price"]) / max(e["market_price"], 0.001)
-            if e.get("won") else -e["bet_usdc"]
+            (e.get("actual_spent") or e["bet_usdc"]) * (1 - e["market_price"]) / max(e["market_price"], 0.001)
+            if e.get("won") else -(e.get("actual_spent") or e["bet_usdc"])
             for e in es
         )
         print(f"  {label:<24}  {n:>4}  {wins:>5}  {wr:>8.1%}  {avg_edge:>8.3f}  ${pnl:>+7.2f}")
@@ -257,10 +257,13 @@ def _print_section(title: str, resolved: list[dict], pending: list[dict], sep: s
     wins        = sum(1 for e in resolved if e["won"])
     losses      = len(resolved) - wins
     win_rate    = wins / len(resolved) if resolved else 0
-    total_staked = sum(e["bet_usdc"] for e in resolved)
+    # Use actual_spent (real CLOB cost) when available, else bet_usdc (signal size)
+    def _spent(e):
+        return e["actual_spent"] if e.get("actual_spent") else e["bet_usdc"]
+    total_staked = sum(_spent(e) for e in resolved)
     pnl = sum(
-        e["bet_usdc"] * (1 - e["market_price"]) / max(e["market_price"], 0.001)
-        if e["won"] else -e["bet_usdc"]
+        _spent(e) * (1 - e["market_price"]) / max(e["market_price"], 0.001)
+        if e["won"] else -_spent(e)
         for e in resolved
     )
     roi = pnl / total_staked if total_staked else 0
@@ -322,11 +325,11 @@ def print_report(entries: list[dict]) -> None:
     if paper_res:
         pw   = sum(1 for e in paper_res if e["won"])
         ppnl = sum(
-            e["bet_usdc"] * (1 - e["market_price"]) / max(e["market_price"], 0.001)
-            if e["won"] else -e["bet_usdc"]
+            (e.get("actual_spent") or e["bet_usdc"]) * (1 - e["market_price"]) / max(e["market_price"], 0.001)
+            if e["won"] else -(e.get("actual_spent") or e["bet_usdc"])
             for e in paper_res
         )
-        pstk = sum(e["bet_usdc"] for e in paper_res)
+        pstk = sum((e.get("actual_spent") or e["bet_usdc"]) for e in paper_res)
         print(f"  Wins     : {pw}    Losses  : {len(paper_res)-pw}    Win rate : {pw/len(paper_res):.1%}")
         print(f"  Sim P&L  : ${ppnl:+.2f}  (ROI {ppnl/pstk:+.1%})  [simulated, not real]")
 

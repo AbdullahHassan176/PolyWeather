@@ -35,6 +35,12 @@ _REGULAR_API   = "https://api.open-meteo.com/v1/forecast"
 # Calibrated forecast RMSE by horizon (°C)
 _SIGMA_BY_HORIZON = [(1, 1.5), (2, 2.0), (3, 2.5), (5, 3.0), (999, 4.0)]
 
+# Bias corrections removed Apr 9 — corrections were based on insufficient data
+# (<30 points per city) and were adding noise rather than signal. The raw
+# ECMWF ensemble is more reliable than manual station-mismatch corrections
+# until we have 50+ resolved trades per city to calibrate against.
+_TEMP_BIAS_F: dict[str, float] = {}
+
 
 def _today_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
@@ -219,6 +225,16 @@ class WeatherClient:
             members = self._fetch_regular(lat, lon, target_date, temp_unit)
 
         if members:
+            # Apply empirical station bias correction before caching.
+            # Derived from resolved trade history: actual - predicted per city.
+            bias_f = _TEMP_BIAS_F.get(city, 0.0)
+            if bias_f != 0.0:
+                bias = bias_f if unit == "F" else bias_f * 5 / 9
+                members = [t + bias for t in members]
+                logger.debug(
+                    f"{city}: applied bias correction {bias_f:+.2f}°F "
+                    f"({'warmer' if bias_f > 0 else 'cooler'})"
+                )
             logger.debug(
                 f"{city} {target_date}: {len(members)} members, "
                 f"mean={np.mean(members):.1f}{unit}, std={np.std(members):.1f}{unit}"

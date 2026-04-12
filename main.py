@@ -64,6 +64,10 @@ def _release_lock():
         pass
 
 from config import cfg
+
+if _PAPER_MODE:
+    cfg.max_trade_usdc = 50.0   # larger paper sizing so Kelly bets clear $5 CLOB min
+
 from polymarket.markets import PolymarketClient
 from polymarket.parser import parse_question
 from polymarket.prices import enrich_with_live_prices, fetch_spread
@@ -187,7 +191,12 @@ def run_scan():
         if budget < 5.0:
             logger.error(f"USDC balance ${budget:.2f} below minimum — aborting scan")
             return
-        logger.info(f"Available budget: ${budget:.2f} USDC")
+        # Auto-scale MAX_TRADE to 9% of balance, capped at $80
+        scaled_max = round(min(budget * 0.09, 80.0), 2)
+        if abs(scaled_max - cfg.max_trade_usdc) >= 1.0:
+            logger.info(f"MAX_TRADE auto-scaled: ${cfg.max_trade_usdc:.2f} → ${scaled_max:.2f} (9% of ${budget:.2f})")
+            cfg.max_trade_usdc = scaled_max
+        logger.info(f"Available budget: ${budget:.2f} USDC  |  max_trade=${cfg.max_trade_usdc:.2f}")
     else:
         budget = cfg.max_trade_usdc * 1_000   # unlimited in dry-run
 
@@ -243,7 +252,7 @@ def run_scan():
         # Skip 1-day horizon unless in experimental paper mode testing 1d between trades.
         # Live: backtesting shows 1d trades are consistently unprofitable (-$206 P&L).
         # Paper: testing whether 1d "between" specifically is viable (ECMWF more accurate at 1d).
-        _min_horizon = 1 if _PAPER_MODE else 2
+        _min_horizon = 1  # 1d allowed on both live and paper — 90.9% WR validated
         if parsed.get("date") and (parsed["date"] - today_utc).days < _min_horizon:
             logger.debug(f"Horizon too short (<{_min_horizon}d), skipping: {market['question'][:65]}")
             continue
@@ -258,6 +267,14 @@ def run_scan():
         # above/below thresholds (-$45/-$21) and exact_c (-$4) all lose money.
         if parsed.get("direction") != "between":
             logger.debug(f"Skipping non-between direction ({parsed.get('direction')}): {market['question'][:55]}")
+            continue
+
+        # Cities where ensemble skill is consistently poor — block on live only.
+        # Seattle: 3/5 losses (60% WR), coastal microclimate mismatches.
+        # San Francisco: massive forecast errors (pred 70.9°F, actual 59.6°F).
+        _BLOCKED_LIVE = {"Seattle", "San Francisco"}
+        if not _PAPER_MODE and parsed.get("city") in _BLOCKED_LIVE:
+            logger.debug(f"Blocked city ({parsed['city']}) on live: {market['question'][:55]}")
             continue
 
         # ── Ensemble probability ──────────────────────────────────────────────
