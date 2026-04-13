@@ -1,13 +1,23 @@
 """
-Weather client — fetches temperature forecasts from Open-Meteo.
+Weather client — fetches temperature forecasts from Open-Meteo + NOAA NWS.
 
 Source priority
 ───────────────
-1. ECMWF ensemble API  (ensemble-api.open-meteo.com) — 50 members, most accurate
-2. GFS ensemble        (same endpoint, gfs_seamless)  — 30 members
-3. Synthetic fallback  — regular point forecast + normal-distribution ensemble,
-                       calibrated σ by horizon:
-                       ≤1d: σ=1.5°C, ≤2d: σ=2.0°C, ≤3d: σ=2.5°C, ≤5d: σ=3.0°C, else σ=4.0°C
+1. Multi-model ensemble (ensemble-api.open-meteo.com):
+     ECMWF IFS025  — 50 members, most accurate globally
+     GFS seamless  — 30 members, strong US coverage
+     ICON seamless — 39 members, German DWD model, independent bias
+     GEM global    — 20 members, Canadian model
+   Total: up to 139 members
+
+2. NWS augmentation (US cities only, api.weather.gov):
+     Official NOAA point forecast — adds 20 synthetic members with tight σ.
+     Reduces station-mismatch error for US markets (Polymarket resolves
+     against NWS-adjacent stations).
+
+3. Synthetic fallback — regular Open-Meteo point forecast + normal-distribution
+   ensemble, calibrated σ by horizon:
+   ≤1d: σ=1.5°C, ≤2d: σ=2.0°C, ≤3d: σ=2.5°C, ≤5d: σ=3.0°C, else σ=4.0°C
 
 Cache strategy
 ──────────────
@@ -31,9 +41,20 @@ from weather.cities import get_coordinates
 _REQUEST_DELAY = 3.0           # minimum seconds between API calls
 _CACHE_FILE    = Path("weather_cache.json")
 _REGULAR_API   = "https://api.open-meteo.com/v1/forecast"
+_NWS_API       = "https://api.weather.gov"
+_NWS_HEADERS   = {"User-Agent": "PolyWeather/1.0 (weather trading bot)"}
 
 # Calibrated forecast RMSE by horizon (°C)
 _SIGMA_BY_HORIZON = [(1, 1.5), (2, 2.0), (3, 2.5), (5, 3.0), (999, 4.0)]
+
+# Tighter sigma for NWS-derived synthetic members — NWS is station-calibrated.
+# In °F (NWS natively reports °F).  Only used up to 7d (NWS forecast range).
+_NWS_SIGMA_BY_HORIZON_F = [(1, 1.0), (2, 1.5), (3, 2.0), (5, 3.0), (7, 4.0)]
+
+# Approximate bounding box for the contiguous US + Alaska/Hawaii buffer.
+# Used to decide whether to call the NWS API.
+_US_LAT = (24.0, 72.0)
+_US_LON = (-180.0, -65.0)
 
 # Bias corrections removed Apr 9 — corrections were based on insufficient data
 # (<30 points per city) and were adding noise rather than signal. The raw
@@ -44,6 +65,10 @@ _TEMP_BIAS_F: dict[str, float] = {}
 
 def _today_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _is_us_coords(lat: float, lon: float) -> bool:
+    return _US_LAT[0] <= lat <= _US_LAT[1] and _US_LON[0] <= lon <= _US_LON[1]
 
 
 def _load_disk_cache() -> dict:
@@ -75,6 +100,8 @@ class WeatherClient:
         self._last_request_time: float = 0.0
         # Track which (endpoint, model) combos have hit their rate limit this session
         self._blocked: set[str] = set()   # entries like "ensemble_api:ecmwf_ifs025"
+        # NWS grid URL cache: "lat,lon" → hourly forecast URL | None
+        self._nws_grids: dict[str, Optional[str]] = {}
         logger.debug(f"WeatherClient: loaded {len(self._cache)} entries from disk cache")
 
     def _throttle(self):
@@ -83,7 +110,7 @@ class WeatherClient:
             time.sleep(_REQUEST_DELAY - elapsed)
         self._last_request_time = time.monotonic()
 
-    # ── Ensemble fetcher (used for both API endpoints) ────────────────────────
+    # ── Ensemble fetcher ──────────────────────────────────────────────────────
 
     def _fetch_ensemble(
         self, lat: float, lon: float, target_date: date, temp_unit: str,
@@ -136,7 +163,59 @@ class WeatherClient:
         ]
         return members if members else None
 
-    # ── Regular forecast (fallback) ────────────────────────────────────────────
+    # ── NWS forecast (US cities, reduces station mismatch) ────────────────────
+
+    def _fetch_nws(
+        self, lat: float, lon: float, target_date: date, temp_unit: str
+    ) -> Optional[float]:
+        """
+        Fetch NOAA NWS daily max temperature for a US location.
+        Returns the max temp in requested unit, or None if unavailable.
+        NWS only provides forecasts ~7 days out.
+        """
+        grid_key = f"{lat:.3f},{lon:.3f}"
+
+        # Resolve grid URL (cached per session)
+        if grid_key not in self._nws_grids:
+            try:
+                resp = self._http.get(
+                    f"{_NWS_API}/points/{lat},{lon}",
+                    headers=_NWS_HEADERS, timeout=10,
+                )
+                if resp.status_code == 200:
+                    self._nws_grids[grid_key] = resp.json()["properties"]["forecastHourly"]
+                else:
+                    self._nws_grids[grid_key] = None
+            except Exception:
+                self._nws_grids[grid_key] = None
+
+        hourly_url = self._nws_grids.get(grid_key)
+        if not hourly_url:
+            return None
+
+        try:
+            self._throttle()
+            resp = self._http.get(hourly_url, headers=_NWS_HEADERS, timeout=15)
+            if resp.status_code != 200:
+                return None
+            periods = resp.json()["properties"]["periods"]
+            target_str = target_date.isoformat()
+            daily_max_f: Optional[float] = None
+            for p in periods:
+                if p["startTime"][:10] == target_str:
+                    t = float(p["temperature"])  # NWS always returns °F
+                    if daily_max_f is None or t > daily_max_f:
+                        daily_max_f = t
+            if daily_max_f is None:
+                return None
+            if temp_unit == "celsius":
+                return (daily_max_f - 32.0) * 5.0 / 9.0
+            return daily_max_f
+        except Exception as exc:
+            logger.debug(f"NWS fetch error: {exc}")
+            return None
+
+    # ── Regular forecast (fallback) ───────────────────────────────────────────
 
     def _fetch_regular(
         self, lat: float, lon: float, target_date: date, temp_unit: str
@@ -193,7 +272,8 @@ class WeatherClient:
     ) -> Optional[list[float]]:
         """
         Return ensemble/synthetic temperature members for a city and date.
-        Tries ECMWF ensemble API first; falls back to regular API on 429.
+        Tries all four ensemble models, augments US cities with NWS data,
+        and falls back to synthetic normal ensemble if all models fail.
         Results are disk-cached.
         """
         coords = get_coordinates(city)
@@ -208,10 +288,9 @@ class WeatherClient:
         lat, lon   = coords
         temp_unit  = "fahrenheit" if unit == "F" else "celsius"
 
-        # Try ECMWF (50 members) + GFS (30 members) from ensemble-api.open-meteo.com.
-        # Falls back to synthetic normal-distribution if rate-limited/unavailable.
+        # ── Step 1: try all four ensemble models ──────────────────────────────
         all_members: list[float] = []
-        for model in ("ecmwf_ifs025", "gfs_seamless"):
+        for model in ("ecmwf_ifs025", "gfs_seamless", "icon_seamless", "gem_global"):
             m = self._fetch_ensemble(lat, lon, target_date, temp_unit,
                                      model=model, api_url=cfg.ensemble_api)
             if m:
@@ -222,23 +301,45 @@ class WeatherClient:
             logger.debug(f"Multi-model ensemble: {len(members)} members for {city}")
         else:
             logger.info(f"Ensemble unavailable for {city} — using regular-API fallback")
-            members = self._fetch_regular(lat, lon, target_date, temp_unit)
+            members = self._fetch_regular(lat, lon, target_date, temp_unit) or []
 
-        if members:
-            # Apply empirical station bias correction before caching.
-            # Derived from resolved trade history: actual - predicted per city.
-            bias_f = _TEMP_BIAS_F.get(city, 0.0)
-            if bias_f != 0.0:
-                bias = bias_f if unit == "F" else bias_f * 5 / 9
-                members = [t + bias for t in members]
+        # ── Step 2: augment with NWS for US cities ────────────────────────────
+        # NWS is the official NOAA forecast, closely tied to the weather stations
+        # Polymarket uses for US market resolution.  Adds 20 tight synthetic members.
+        today = date.today()
+        horizon_days = (target_date - today).days
+        if _is_us_coords(lat, lon) and 1 <= horizon_days <= 7:
+            nws_temp = self._fetch_nws(lat, lon, target_date, temp_unit)
+            if nws_temp is not None:
+                sigma_f = next(s for h, s in _NWS_SIGMA_BY_HORIZON_F if horizon_days <= h)
+                nws_sigma = sigma_f if unit == "F" else sigma_f * 5.0 / 9.0
+                rng = np.random.default_rng(seed=int(target_date.strftime("%Y%m%d")) + 999)
+                nws_members = rng.normal(loc=nws_temp, scale=nws_sigma, size=20).tolist()
+                members = members + nws_members
                 logger.debug(
-                    f"{city}: applied bias correction {bias_f:+.2f}°F "
-                    f"({'warmer' if bias_f > 0 else 'cooler'})"
+                    f"NWS augmentation for {city}: {nws_temp:.1f}°{unit} "
+                    f"(σ={nws_sigma:.1f}), +20 members → {len(members)} total"
                 )
+
+        if not members:
+            self._cache[cache_key] = None
+            return None
+
+        # ── Step 3: apply bias corrections (currently empty) ─────────────────
+        bias_f = _TEMP_BIAS_F.get(city, 0.0)
+        if bias_f != 0.0:
+            bias = bias_f if unit == "F" else bias_f * 5 / 9
+            members = [t + bias for t in members]
             logger.debug(
-                f"{city} {target_date}: {len(members)} members, "
-                f"mean={np.mean(members):.1f}{unit}, std={np.std(members):.1f}{unit}"
+                f"{city}: applied bias correction {bias_f:+.2f}°F "
+                f"({'warmer' if bias_f > 0 else 'cooler'})"
             )
+
+        logger.debug(
+            f"{city} {target_date}: {len(members)} members, "
+            f"mean={np.mean(members):.1f}°{unit}, std={np.std(members):.1f}°{unit}"
+        )
+
         self._cache[cache_key] = members
         _save_disk_cache(self._cache)
         return members
@@ -254,7 +355,7 @@ class WeatherClient:
 
         Keys
         ----
-        method        : "ensemble" or "regular_fallback"
+        method        : "ensemble", "multi_model", "nws_augmented", or "regular_fallback"
         n_members     : number of ensemble members used
         forecast_mean : mean of member temps
         forecast_std  : std-dev of member temps
@@ -264,21 +365,23 @@ class WeatherClient:
         if temps is None:
             return None
 
-        coords = get_coordinates(city)
-        temp_unit = "fahrenheit" if unit == "F" else "celsius"
-
         all_ensemble_blocked = all(
             f"{cfg.ensemble_api}:{m}" in self._blocked
-            for m in ("ecmwf_ifs025", "gfs_seamless")
+            for m in ("ecmwf_ifs025", "gfs_seamless", "icon_seamless", "gem_global")
         )
-        if all_ensemble_blocked or len(temps) <= 50:
-            method = "regular_fallback" if all_ensemble_blocked else "ensemble"
-        else:
+        n = len(temps)
+        if all_ensemble_blocked:
+            method = "regular_fallback"
+        elif n > 139:
+            method = "nws_augmented"   # ensemble + NWS top-up
+        elif n > 50:
             method = "multi_model"
+        else:
+            method = "ensemble"
 
         return {
             "method": method,
-            "n_members": len(temps),
+            "n_members": n,
             "forecast_mean": round(float(np.mean(temps)), 2),
             "forecast_std": round(float(np.std(temps)), 2),
         }
