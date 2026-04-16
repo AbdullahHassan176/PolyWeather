@@ -143,8 +143,9 @@ def analyze(
         return None
 
     # For NO bets: require NO token price >= 0.83.
-    # Data: 0.83-0.85 band is 100% WR. 0.78-0.83 band is marginally profitable at best,
-    # and the 0.81-0.82 sub-band showed 25% WR (-$22). Higher floor = lower breakeven needed.
+    # Data (80 clean between+NO trades): 0.75-0.83 band = 76% WR but -$11 P&L — losing.
+    # 0.83-0.87 band = 86% WR, break-even trending positive. Higher floor = higher breakeven needed.
+    # Apr 12-13 dead zone was a market liquidity gap, not a floor problem.
     if side == "NO" and price < 0.83:
         logger.debug(f"NO token price too low ({price:.3f} < 0.83) — below profitable band, skipping")
         return None
